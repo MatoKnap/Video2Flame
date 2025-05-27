@@ -1,3 +1,6 @@
 [submodule "MICA"]
 	path = MICA
 	url = https://github.com/Zielon/MICA.git
+[submodule "FLAME_PyTorch"]
+	path = FLAME_PyTorch
+	url = https://github.com/soubhiksanyal/FLAME_PyTorch.git
