@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+websockets
+numpy
+scikit-learn
+sounddevice
+python-multipart
