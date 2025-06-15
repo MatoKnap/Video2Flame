@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,19 +7,21 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css">
     <script src="https://cdn.plot.ly/plotly-2.16.1.min.js"></script>
     <style>
-        body { padding: 2rem; }
+        body { padding: 1rem 2rem; }
         .hidden { display: none; }
         #plot-container { min-height: 450px; margin-top: 2rem; }
         .controls-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: end;}
         .slider-container { margin-top: 1rem; }
         #volume-display { font-weight: bold; margin-left: 1rem; }
+        #cycle-status { min-height: 3rem; margin-top: 1rem; border: 1px solid var(--muted-border-color); padding: 0.5rem; border-radius: var(--border-radius);}
+        .status-playing { color: var(--pico-color-green-400); font-weight: bold; }
     </style>
 </head>
 <body>
     <main class="container">
         <header>
             <h1>Hearing Calibration with Bayesian Optimization</h1>
-            <p>Calibrate your headphones against a reference source efficiently.</p>
+            <p>Find your equal-loudness curve by comparing frequencies against a fixed root tone.</p>
         </header>
 
         <!-- SETUP SECTION -->
@@ -27,20 +29,20 @@
             <article>
                 <hgroup>
                     <h2>1. Setup</h2>
-                    <p>Select your audio devices and set the reference volume.</p>
+                    <p>Select your audio device and set the root tone properties.</p>
                 </hgroup>
                 <div class="grid">
                     <div>
-                        <label for="ref-device">Reference Device (e.g., Speakers)</label>
-                        <select id="ref-device" required></select>
+                        <label for="audio-device">Audio Device</label>
+                        <select id="audio-device" required></select>
                     </div>
                     <div>
-                        <label for="test-device">Test Device (e.g., Headphones)</label>
-                        <select id="test-device" required></select>
+                        <label for="root-freq">Root Frequency (Hz)</label>
+                        <input type="number" id="root-freq" value="1000" step="50">
                     </div>
                 </div>
-                <label for="ref-volume">Reference Volume (at 1kHz)</label>
-                <input type="number" id="ref-volume" value="-25" step="1">
+                <label for="root-volume">Root Volume (dBFS)</label>
+                <input type="number" id="root-volume" value="-25" step="1">
                 <small>Set a comfortable, clear listening level. -25 dBFS is a safe start.</small>
                 <br><br>
                 <button id="start-btn">Start Test</button>
@@ -51,167 +53,175 @@
         <section id="test-section" class="hidden">
             <article>
                 <hgroup>
-                    <h2>2. Perform Test</h2>
-                    <p>Listen to the reference and test tones, and adjust the slider until they sound equally loud.</p>
+                    <h2 id="test-phase-title">Now testing...</h2>
+                    <p>The root tone and test tone will play automatically. Adjust the slider until they sound equally loud, then confirm.</p>
                 </hgroup>
 
-                <div id="test-info">
-                    <h3>Now testing: <span id="current-freq">...</span> Hz</h3>
+                <div id="cycle-status">
+                    Now Playing: <span id="playing-indicator">Paused</span>
                 </div>
 
-                <div class="controls-grid">
-                    <button id="play-ref-btn">Play Reference (1kHz)</button>
-                    <button id="play-test-btn" class="secondary">Play Test Tone</button>
+                <div class="grid">
+                    <div>
+                        <label for="cycle-speed">Cycle Speed (ms)</label>
+                        <input type="number" id="cycle-speed" value="800" step="100" min="200">
+                    </div>
+                    <div>
+                        <label> </label>
+                        <button id="cycle-toggle-btn">Start Auto-Cycle</button>
+                    </div>
                 </div>
-                
+
                 <div class="slider-container">
-                    <label for="volume-slider">Test Volume<span id="volume-display">-40.0 dB</span></label>
+                    <label for="volume-slider">Test Volume (<span id="current-freq-label">...</span> Hz)<span id="volume-display">-40.0 dB</span></label>
                     <input type="range" min="-80" max="0" value="-40" step="0.5" id="volume-slider">
                 </div>
 
                 <button id="confirm-btn" aria-busy="false">Confirm and Go to Next Point</button>
             </article>
-
+            
+            <button id="toggle-axis-btn" class="secondary outline">Toggle X-Axis (Log/Linear)</button>
             <div id="plot-container"></div>
         </section>
     </main>
 
     <script>
         document.addEventListener('DOMContentLoaded', () => {
+            // --- State ---
+            let ws;
+            let currentTestFreq = null;
+            let cycleInterval = null;
+            let isCyclePlaying = false;
+            let cycleState = 'root'; // 'root' or 'test'
+            let seedingInfo = { total: 0, current: 0 };
+            let plotLayout = {
+                title: 'Equal Loudness Curve',
+                xaxis: { title: 'Frequency (Hz)', type: 'log', autorange: true },
+                yaxis: { title: 'Volume (dBFS)', autorange: true, range: [-80, 0]},
+                margin: { t: 40, b: 40, l: 40, r: 20 },
+                showlegend: false
+            };
+
             // --- DOM Elements ---
             const setupSection = document.getElementById('setup-section');
             const testSection = document.getElementById('test-section');
-            const refDeviceSelect = document.getElementById('ref-device');
-            const testDeviceSelect = document.getElementById('test-device');
-            const refVolumeInput = document.getElementById('ref-volume');
+            const audioDeviceSelect = document.getElementById('audio-device');
+            const rootFreqInput = document.getElementById('root-freq');
+            const rootVolumeInput = document.getElementById('root-volume');
             const startBtn = document.getElementById('start-btn');
-            const playRefBtn = document.getElementById('play-ref-btn');
-            const playTestBtn = document.getElementById('play-test-btn');
             const confirmBtn = document.getElementById('confirm-btn');
             const volumeSlider = document.getElementById('volume-slider');
             const volumeDisplay = document.getElementById('volume-display');
-            const currentFreqSpan = document.getElementById('current-freq');
+            const testPhaseTitle = document.getElementById('test-phase-title');
+            const currentFreqLabel = document.getElementById('current-freq-label');
             const plotContainer = document.getElementById('plot-container');
+            const cycleToggleBtn = document.getElementById('cycle-toggle-btn');
+            const cycleSpeedInput = document.getElementById('cycle-speed');
+            const playingIndicator = document.getElementById('playing-indicator');
+            const toggleAxisBtn = document.getElementById('toggle-axis-btn');
 
-            let ws;
-            let currentTestFreq = null;
-
-            // --- Initial Setup ---
+            // --- Initialization ---
             const init = async () => {
                 try {
                     const response = await fetch('/api/devices');
                     const devices = await response.json();
-                    
-                    refDeviceSelect.innerHTML = '';
-                    testDeviceSelect.innerHTML = '';
-
+                    audioDeviceSelect.innerHTML = '';
                     devices.forEach(device => {
-                        const option1 = new Option(device.name, device.id);
-                        const option2 = new Option(device.name, device.id);
-                        refDeviceSelect.add(option1);
-                        testDeviceSelect.add(option2);
+                        audioDeviceSelect.add(new Option(device.name, device.id));
                     });
                 } catch (error) {
-                    console.error("Failed to fetch devices:", error);
-                    alert("Could not connect to the backend. Make sure the server is running.");
+                    alert("Could not connect to the backend. Ensure it's running.");
                 }
             };
-            
+
             // --- WebSocket Logic ---
             const connectWebSocket = () => {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-
-                ws.onmessage = (event) => {
-                    const message = JSON.parse(event.data);
-                    
-                    switch (message.type) {
-                        case 'test_started':
-                            setupSection.classList.add('hidden');
-                            testSection.classList.remove('hidden');
-                            initPlot();
-                            break;
-                        case 'new_point':
-                            currentTestFreq = message.frequency;
-                            currentFreqSpan.textContent = Math.round(currentTestFreq);
-                            confirmBtn.disabled = false;
-                            confirmBtn.setAttribute('aria-busy', 'false');
-                            break;
-                        case 'update_curve':
-                            drawPlot(message.data);
-                            break;
-                    }
-                };
-
-                ws.onclose = () => {
-                    alert("WebSocket connection closed. Please refresh the page.");
-                };
-
-                ws.onerror = (error) => {
-                    console.error("WebSocket error:", error);
-                    alert("WebSocket connection error. Please refresh the page.");
-                };
+                ws.onmessage = handleWebSocketMessage;
+                ws.onclose = () => alert("WebSocket connection closed. Please refresh.");
+                ws.onerror = (e) => console.error("WebSocket error:", e);
             };
-            
-            const sendMessage = (data) => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(data));
+
+            const handleWebSocketMessage = (event) => {
+                const message = JSON.parse(event.data);
+                switch (message.type) {
+                    case 'test_started':
+                        seedingInfo.total = message.seeding_total;
+                        setupSection.classList.add('hidden');
+                        testSection.classList.remove('hidden');
+                        initPlot();
+                        break;
+                    case 'new_point':
+                        currentTestFreq = message.frequency;
+                        currentFreqLabel.textContent = Math.round(currentTestFreq);
+                        if (message.seeding_current > 0) {
+                            seedingInfo.current = message.seeding_current;
+                            testPhaseTitle.textContent = `Initial Calibration: Point ${seedingInfo.current} of ${seedingInfo.total}`;
+                        } else {
+                            testPhaseTitle.textContent = `Optimizing: Testing point at ${Math.round(currentTestFreq)} Hz`;
+                        }
+                        confirmBtn.disabled = false;
+                        confirmBtn.setAttribute('aria-busy', 'false');
+                        break;
+                    case 'update_curve':
+                        drawPlot(message.data);
+                        break;
                 }
             };
+            
+            const sendMessage = (data) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(data));
 
             // --- Plotting ---
             const initPlot = () => {
-                const layout = {
-                    title: 'Equal Loudness Curve',
-                    xaxis: { title: 'Frequency (Hz)', type: 'log', autorange: true },
-                    yaxis: { title: 'Volume (dBFS)', autorange: true },
-                    margin: { t: 40, b: 40, l: 40, r: 20 },
-                    showlegend: false
-                };
-                Plotly.newPlot(plotContainer, [], layout, {responsive: true});
+                Plotly.newPlot(plotContainer, [], plotLayout, {responsive: true});
             };
 
             const drawPlot = (data) => {
                 const { freqs, mean, std, points } = data;
-
                 if (!freqs || freqs.length === 0) return;
 
                 const upper_bound = mean.map((m, i) => m + std[i]);
                 const lower_bound = mean.map((m, i) => m - std[i]);
-
+                
                 const traces = [
-                    { // Measured points
-                        x: points.freqs,
-                        y: points.volumes,
-                        mode: 'markers',
-                        type: 'scatter',
-                        marker: { color: 'red', size: 8 }
-                    },
-                    { // Mean curve
-                        x: freqs,
-                        y: mean,
-                        mode: 'lines',
-                        type: 'scatter',
-                        line: { color: 'blue', width: 3 }
-                    },
-                    { // Uncertainty band (lower)
-                        x: freqs,
-                        y: lower_bound,
-                        mode: 'lines',
-                        type: 'scatter',
-                        line: { width: 0 }
-                    },
-                    { // Uncertainty band (upper)
-                        x: freqs,
-                        y: upper_bound,
-                        mode: 'lines',
-                        type: 'scatter',
-                        fill: 'tonexty',
-                        fillcolor: 'rgba(0,0,255,0.2)',
-                        line: { width: 0 }
-                    }
+                    { x: points.freqs, y: points.volumes, mode: 'markers', type: 'scatter', marker: { color: 'red', size: 8 }},
+                    { x: freqs, y: mean, mode: 'lines', type: 'scatter', line: { color: 'var(--pico-primary)', width: 3 }},
+                    { x: freqs, y: lower_bound, mode: 'lines', type: 'scatter', line: { width: 0 }},
+                    { x: freqs, y: upper_bound, mode: 'lines', type: 'scatter', fill: 'tonexty', fillcolor: 'rgba(0,117,255,0.2)', line: { width: 0 }}
                 ];
-                Plotly.react(plotContainer, traces);
+                Plotly.react(plotContainer, traces, plotLayout);
+            };
+
+            // --- Audio Cycle Logic ---
+            const startCycle = () => {
+                if (cycleInterval) clearInterval(cycleInterval);
+                const speed = parseInt(cycleSpeedInput.value, 10);
+                cycleInterval = setInterval(playNextInCycle, speed);
+                isCyclePlaying = true;
+                cycleToggleBtn.textContent = 'Pause Auto-Cycle';
+            };
+
+            const stopCycle = () => {
+                if (cycleInterval) clearInterval(cycleInterval);
+                cycleInterval = null;
+                isCyclePlaying = false;
+                cycleToggleBtn.textContent = 'Start Auto-Cycle';
+                playingIndicator.textContent = "Paused";
+                playingIndicator.classList.remove('status-playing');
+            };
+
+            const playNextInCycle = () => {
+                if (cycleState === 'root') {
+                    sendMessage({ type: 'play_root' });
+                    playingIndicator.textContent = `Root (${rootFreqInput.value} Hz)`;
+                    cycleState = 'test';
+                } else {
+                    sendMessage({ type: 'play_test', volume: volumeSlider.value });
+                    playingIndicator.textContent = `Test (${Math.round(currentTestFreq)} Hz)`;
+                    cycleState = 'root';
+                }
+                playingIndicator.classList.add('status-playing');
             };
 
             // --- Event Listeners ---
@@ -220,22 +230,19 @@
                 ws.onopen = () => {
                     sendMessage({
                         type: 'start_test',
-                        ref_device_id: refDeviceSelect.value,
-                        test_device_id: testDeviceSelect.value,
-                        ref_volume: refVolumeInput.value
+                        device_id: audioDeviceSelect.value,
+                        root_freq: rootFreqInput.value,
+                        root_volume: rootVolumeInput.value
                     });
                 };
             });
 
-            playRefBtn.addEventListener('click', () => {
-                sendMessage({ type: 'play_reference' });
+            cycleToggleBtn.addEventListener('click', () => {
+                isCyclePlaying ? stopCycle() : startCycle();
             });
 
-            playTestBtn.addEventListener('click', () => {
-                sendMessage({
-                    type: 'play_test',
-                    volume: volumeSlider.value
-                });
+            cycleSpeedInput.addEventListener('change', () => {
+                if(isCyclePlaying) startCycle(); // Restart with new speed
             });
 
             volumeSlider.addEventListener('input', () => {
@@ -243,6 +250,7 @@
             });
 
             confirmBtn.addEventListener('click', () => {
+                stopCycle();
                 confirmBtn.disabled = true;
                 confirmBtn.setAttribute('aria-busy', 'true');
                 sendMessage({
@@ -250,6 +258,12 @@
                     frequency: currentTestFreq,
                     volume: volumeSlider.value
                 });
+            });
+            
+            toggleAxisBtn.addEventListener('click', () => {
+                const currentType = plotLayout.xaxis.type;
+                plotLayout.xaxis.type = (currentType === 'log') ? 'linear' : 'log';
+                Plotly.relayout(plotContainer, plotLayout);
             });
 
             // --- Initialize Page ---

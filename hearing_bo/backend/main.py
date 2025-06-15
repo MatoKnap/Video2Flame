@@ -1,9 +1,9 @@
 # backend/main.py
 
 import json
+import random
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 
 from audio import list_audio_devices, generate_tone, play_audio
 from bo_logic import BayesianCurveFitter
@@ -11,7 +11,7 @@ from bo_logic import BayesianCurveFitter
 app = FastAPI()
 
 # A singleton instance of our Bayesian optimizer
-bo_fitter = BayesianCurveFitter()
+bo_fitter = BayesianCurveFitter(freq_range=(40, 16000))
 
 @app.get("/")
 async def get_index():
@@ -29,10 +29,13 @@ async def websocket_endpoint(websocket: WebSocket):
     
     # Store test state within the websocket connection scope
     test_state = {
-        "ref_device_id": None,
-        "test_device_id": None,
-        "ref_volume": -20.0,
-        "current_test_freq": None
+        "device_id": None,
+        "root_freq": 1000.0,
+        "root_volume": -25.0,
+        "current_test_freq": None,
+        "seed_points": [],
+        "seed_index": 0,
+        "is_seeding": False,
     }
 
     try:
@@ -43,56 +46,95 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg_type == "start_test":
                 bo_fitter.reset()
-                test_state["ref_device_id"] = int(message["ref_device_id"])
-                test_state["test_device_id"] = int(message["test_device_id"])
-                test_state["ref_volume"] = float(message["ref_volume"])
+                test_state["device_id"] = int(message["device_id"])
+                test_state["root_freq"] = float(message["root_freq"])
+                test_state["root_volume"] = float(message["root_volume"])
 
-                # Add the reference point (1kHz) automatically
-                bo_fitter.add_point(1000.0, test_state["ref_volume"])
+                # Add the root point automatically
+                bo_fitter.add_point(test_state["root_freq"], test_state["root_volume"])
 
-                # Get the first point to test from the BO logic
-                next_freq = bo_fitter.get_next_point()
+                # --- NEW: Initial Seeding Logic ---
+                test_state["is_seeding"] = True
+                # Generate 3 quasi-random points, avoiding the root frequency
+                log_min, log_max = bo_fitter.log_freq_range
+                seed_log_freqs = [test_state["root_freq"]]
+                while len(seed_log_freqs) < 4:
+                    rand_log_freq = random.uniform(log_min, log_max)
+                    # Ensure new random points are not too close to existing ones
+                    if all(abs(rand_log_freq - s) > 0.1 for s in seed_log_freqs):
+                         seed_log_freqs.append(rand_log_freq)
+                
+                # We already have the root, so we only need to test the new ones
+                test_state["seed_points"] = [10**f for f in seed_log_freqs[1:]]
+                test_state["seed_index"] = 0
+                
+                # Send the first seed point to test
+                next_freq = test_state["seed_points"][0]
                 test_state["current_test_freq"] = next_freq
                 
-                await websocket.send_text(json.dumps({"type": "test_started"}))
+                await websocket.send_text(json.dumps({
+                    "type": "test_started",
+                    "seeding_total": len(test_state["seed_points"])
+                }))
                 await websocket.send_text(json.dumps({
                     "type": "new_point", 
-                    "frequency": next_freq
+                    "frequency": next_freq,
+                    "seeding_current": 1
                 }))
 
-            elif msg_type == "play_reference":
-                tone = generate_tone(1000.0, test_state["ref_volume"])
-                play_audio(test_state["ref_device_id"], tone)
+            elif msg_type == "play_root":
+                tone = generate_tone(test_state["root_freq"], test_state["root_volume"])
+                play_audio(test_state["device_id"], tone)
 
             elif msg_type == "play_test":
                 freq = test_state["current_test_freq"]
                 vol = float(message["volume"])
                 tone = generate_tone(freq, vol)
-                play_audio(test_state["test_device_id"], tone)
+                play_audio(test_state["device_id"], tone)
 
             elif msg_type == "submit_volume":
                 freq = test_state["current_test_freq"]
                 vol = float(message["volume"])
-                
-                # Update the model
                 bo_fitter.add_point(freq, vol)
-                bo_fitter.fit_model()
-                
-                # Get the next point to test
-                next_freq = bo_fitter.get_next_point()
-                test_state["current_test_freq"] = next_freq
 
+                next_freq = None
+                if test_state["is_seeding"]:
+                    test_state["seed_index"] += 1
+                    if test_state["seed_index"] < len(test_state["seed_points"]):
+                        # --- More seed points to test ---
+                        next_freq = test_state["seed_points"][test_state["seed_index"]]
+                        await websocket.send_text(json.dumps({
+                            "type": "new_point",
+                            "frequency": next_freq,
+                            "seeding_current": test_state["seed_index"] + 1
+                        }))
+                    else:
+                        # --- Seeding finished ---
+                        test_state["is_seeding"] = False
+                        bo_fitter.fit_model()
+                        next_freq = bo_fitter.get_next_point()
+                        await websocket.send_text(json.dumps({
+                            "type": "new_point",
+                            "frequency": next_freq,
+                            "seeding_current": 0 # Indicates seeding is over
+                        }))
+                else:
+                    # --- Normal BO loop ---
+                    bo_fitter.fit_model()
+                    next_freq = bo_fitter.get_next_point()
+                    await websocket.send_text(json.dumps({
+                        "type": "new_point",
+                        "frequency": next_freq,
+                        "seeding_current": 0
+                    }))
+                
+                test_state["current_test_freq"] = next_freq
+                
                 # Send updated curve data to the frontend
                 curve_data = bo_fitter.get_full_curve()
                 await websocket.send_text(json.dumps({
                     "type": "update_curve",
                     "data": curve_data
-                }))
-                
-                # Send the next point to test
-                await websocket.send_text(json.dumps({
-                    "type": "new_point",
-                    "frequency": next_freq
                 }))
 
     except WebSocketDisconnect:
